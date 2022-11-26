@@ -25,6 +25,7 @@ set(ES_INJECTOR_PUBLIC_LIBS
 
 set(ES_INJECTOR_PRIVATE_LIBS
     fmt
+    frida-core
     frida-gum
 )
 
