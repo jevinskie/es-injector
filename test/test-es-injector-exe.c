@@ -1,5 +1,5 @@
-#include <stdio.h>
 #include <os/log.h>
+#include <stdio.h>
 
 static os_log_t logger;
 
