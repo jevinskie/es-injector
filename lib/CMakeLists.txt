@@ -27,7 +27,6 @@ set(ES_INJECTOR_PRIVATE_LIBS
     fmt
     bsm
     EndpointSecurity
-    frida-gum
 )
 
 # ES_INJECTOR_HDR added for Xcode project generation
