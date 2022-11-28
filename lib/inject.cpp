@@ -16,7 +16,8 @@
 
 #include <fmt/format.h>
 
-constexpr uint32_t PAGE_SZ = 4096;
+constexpr uint32_t PAGE_SZ_4K  = 4096;
+constexpr uint32_t PAGE_SZ_16K = 16 * 1024;
 
 static void mach_check(kern_return_t kr, const std::string &msg) {
     if (kr != KERN_SUCCESS) {
@@ -62,7 +63,8 @@ static void write_target(const task_t task, uint64_t addr, std::span<const uint8
 static std::string read_cstr_target(const task_t task, uint64_t addr) {
     std::vector<uint8_t> buf;
     do {
-        const auto end_addr = addr % PAGE_SZ ? roundup_pow2_mul(addr, PAGE_SZ) : addr + PAGE_SZ;
+        const auto end_addr =
+            addr % PAGE_SZ_4K ? roundup_pow2_mul(addr, PAGE_SZ_4K) : addr + PAGE_SZ_4K;
         const auto smol_buf = read_target(task, addr, end_addr - addr);
         buf.insert(buf.end(), smol_buf.cbegin(), smol_buf.cend());
         addr = end_addr;
@@ -86,9 +88,9 @@ static uint64_t get_dyld_base(const task_t task) {
     const dyld_all_image_infos *all_img_infos = (dyld_all_image_infos *)all_info_buf.data();
     assert(all_img_infos->version >= 10); // when amfi_check_dyld_policy_self was added
     // dyldImageLoadAddress isn't initialized at this early stage, scan down for macho header
-    uint64_t macho_probe_addr = rounddown_pow2_mul(dyld_info.all_image_info_addr, PAGE_SZ);
+    uint64_t macho_probe_addr = rounddown_pow2_mul(dyld_info.all_image_info_addr, PAGE_SZ_4K);
     while (!is_macho_magic_at(task, macho_probe_addr)) {
-        macho_probe_addr -= PAGE_SZ;
+        macho_probe_addr -= PAGE_SZ_4K;
     }
     return macho_probe_addr;
 }
@@ -185,6 +187,34 @@ static void patch_dyld(const task_t task) {
     uint64_t amfi_check_dyld_policy_self_addr =
         get_amfi_check_dyld_policy_self_addr(task, dyld_base);
     fmt::print("amfi_check_dyld_policy_self: {:p}\n", (void *)amfi_check_dyld_policy_self_addr);
+    // int amfi_check_dyld_policy_self_patched(uint64_t inFlags, uint64_t* outFlags) {
+    //     *outFlags = UINT64_MAX;
+    //     return 0;
+    // }
+#ifdef __arm64__
+    // mov x8, #-1
+    // str x8, [x1]
+    // mov w0, #0
+    // ret
+    const uint8_t patch[] = {0x08, 0x00, 0x80, 0x92, 0x28, 0x00, 0x00, 0xf9,
+                             0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+#elif defined(__x86_64__)
+    // or qword ptr [rsi], -1
+    // xor eax, eax
+    // ret
+    const uint8_t patch[] = {0x48, 0x83, 0x0e, 0xff, 0x31, 0xc0, 0xc3};
+#else
+#error bad arch
+#endif
+    const auto patch_page_addr = rounddown_pow2_mul(amfi_check_dyld_policy_self_addr, PAGE_SZ_4K);
+    const auto kr_prot_rw      = vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0,
+                                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    mach_check(kr_prot_rw, "vm_protect RW");
+    write_target(task, amfi_check_dyld_policy_self_addr,
+                 std::span<const uint8_t>(patch, sizeof(patch)));
+    const auto kr_prot_rx =
+        vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    mach_check(kr_prot_rx, "vm_protect RX");
 }
 
 static void inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars) {
