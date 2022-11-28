@@ -34,6 +34,14 @@ template <typename U> static constexpr U roundup_pow2_mul(U num, size_t pow2_mul
     return (num + mask) & ~mask;
 }
 
+// behavior:
+// roundup_pow2_mul(16, 16) = 16
+// roundup_pow2_mul(17, 16) = 16
+template <typename U> static constexpr U rounddown_pow2_mul(U num, size_t pow2_mul) {
+    const U mask = static_cast<U>(pow2_mul) - 1;
+    return num & ~mask;
+}
+
 static std::vector<uint8_t> read_target(const task_t task, uint64_t addr, uint64_t sz) {
     std::vector<uint8_t> res;
     res.resize(sz);
@@ -62,6 +70,11 @@ static std::string read_cstr_target(const task_t task, uint64_t addr) {
     return {(char *)buf.data()};
 }
 
+static bool is_macho_magic_at(const task_t task, uint64_t addr) {
+    const auto macho_magic_buf = read_target(task, addr, 4);
+    return *(uint32_t *)macho_magic_buf.data() == MH_MAGIC_64;
+}
+
 static uint64_t get_dyld_base(const task_t task) {
     task_dyld_info_data_t dyld_info;
     mach_msg_type_number_t cnt = TASK_DYLD_INFO_COUNT;
@@ -72,7 +85,12 @@ static uint64_t get_dyld_base(const task_t task) {
         read_target(task, dyld_info.all_image_info_addr, dyld_info.all_image_info_size);
     const dyld_all_image_infos *all_img_infos = (dyld_all_image_infos *)all_info_buf.data();
     assert(all_img_infos->version >= 10); // when amfi_check_dyld_policy_self was added
-    return (uint64_t)all_img_infos->dyldImageLoadAddress;
+    // dyldImageLoadAddress isn't initialized at this early stage, scan down for macho header
+    uint64_t macho_probe_addr = rounddown_pow2_mul(dyld_info.all_image_info_addr, PAGE_SZ);
+    while (!is_macho_magic_at(task, macho_probe_addr)) {
+        macho_probe_addr -= PAGE_SZ;
+    }
+    return macho_probe_addr;
 }
 
 static bool is_arm64(const task_t task, const uint64_t dyld_base) {
@@ -143,7 +161,6 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
         for (uint32_t i = 0; i < symtab->nsyms; ++i) {
             const auto sym  = syms[i];
             const auto name = std::string((char *)&strs[sym.n_un.n_strx]);
-            fmt::print("name: {:s}\n", name);
             if (name == "_amfi_check_dyld_policy_self") {
                 return dyld_base + sym.n_value;
             }
@@ -158,7 +175,8 @@ static void inject_stack(const task_t task, const thread_t thread,
 
 static void patch_dyld(const task_t task) {
     const auto dyld_base = get_dyld_base(task);
-    const auto arm64     = is_arm64(task, dyld_base);
+    fmt::print("dyld_base: {:p}\n", (void *)dyld_base);
+    const auto arm64 = is_arm64(task, dyld_base);
 #ifdef __arm64__
     assert(arm64);
 #else
