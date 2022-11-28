@@ -4,6 +4,8 @@
 static os_log_t logger;
 
 int main(void) {
+    uint64_t dummy;
+    printf("&dummy stack var: %p\n", &dummy);
     printf("test-es-inject-exe: hello from main!\n");
     logger = os_log_create("vin.je.test-es-injector-exe", "test");
     os_log(logger, "hello from main");

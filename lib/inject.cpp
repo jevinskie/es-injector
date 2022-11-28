@@ -16,14 +16,43 @@
 
 #include <fmt/format.h>
 
-constexpr uint32_t PAGE_SZ_4K  = 4096;
-constexpr uint32_t PAGE_SZ_16K = 16 * 1024;
+constexpr uint32_t PAGE_SZ_4K = 4096;
 
 static void mach_check(kern_return_t kr, const std::string &msg) {
     if (kr != KERN_SUCCESS) {
         fmt::print(stderr, "Mach error: '{:s}' retval: {:d} description: '{:s}'\n", msg, kr,
                    mach_error_string(kr));
         exit(-1);
+    }
+}
+
+// https://gist.github.com/ccbrown/9722406
+static void hexdump(const void *data, size_t size) {
+    char ascii[17];
+    size_t i, j;
+    ascii[16] = '\0';
+    for (i = 0; i < size; ++i) {
+        printf("%02X ", ((unsigned char *)data)[i]);
+        if (((unsigned char *)data)[i] >= ' ' && ((unsigned char *)data)[i] <= '~') {
+            ascii[i % 16] = ((unsigned char *)data)[i];
+        } else {
+            ascii[i % 16] = '.';
+        }
+        if ((i + 1) % 8 == 0 || i + 1 == size) {
+            printf(" ");
+            if ((i + 1) % 16 == 0) {
+                printf("|  %s \n", ascii);
+            } else if (i + 1 == size) {
+                ascii[(i + 1) % 16] = '\0';
+                if ((i + 1) % 16 <= 8) {
+                    printf(" ");
+                }
+                for (j = (i + 1) % 16; j < 16; ++j) {
+                    printf("   ");
+                }
+                printf("|  %s \n", ascii);
+            }
+        }
     }
 }
 
@@ -52,6 +81,12 @@ static std::vector<uint8_t> read_target(const task_t task, uint64_t addr, uint64
     mach_check(kr, "vm_read_overwrite");
     assert(vm_sz == sz);
     return res;
+}
+
+template <typename T> static T read_target(const task_t task, uint64_t addr) {
+    const auto buf = read_target(task, addr, sizeof(T));
+    hexdump(buf.data(), buf.size());
+    return *(T *)buf.data();
 }
 
 static void write_target(const task_t task, uint64_t addr, std::span<const uint8_t> buf) {
@@ -103,27 +138,7 @@ static bool is_arm64(const task_t task, const uint64_t dyld_base) {
     return hdr->cputype == CPU_TYPE_ARM64;
 }
 
-static uint64_t get_pc(const task_t task, const thread_t thread) {
-#ifdef __arm64__
-    mach_msg_type_number_t gpr_cnt = ARM_THREAD_STATE64_COUNT;
-    arm_thread_state64_t gpr_state;
-    const auto kr_thread_get_gpr =
-        thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
-    mach_check(kr_thread_get_gpr, "thread_get_state pc");
-    return arm_thread_state64_get_pc(gpr_state);
-#elif defined(__x86_64__)
-    mach_msg_type_number_t gpr_cnt = x86_THREAD_STATE64_COUNT;
-    x86_thread_state64_t gpr_state;
-    const auto kr_thread_get_gpr =
-        thread_get_state(thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
-    mach_check(kr_thread_get_gpr, "thread_get_state pc");
-    return gpr_state.__rip;
-#else
-#error bad arch
-#endif
-}
-
-static uint64_t get_sp(const task_t task, const thread_t thread) {
+static uint64_t get_sp(const thread_t thread) {
 #ifdef __arm64__
     mach_msg_type_number_t gpr_cnt = ARM_THREAD_STATE64_COUNT;
     arm_thread_state64_t gpr_state;
@@ -172,8 +187,61 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
     assert(!"symtab not found");
 }
 
-static void inject_stack(const task_t task, const thread_t thread,
-                         const std::vector<std::string> &injected_env_vars) {}
+/* bsd/kern/kern_exec.c: exec_copyout_strings
+ *
+ *      +-------------+ <- p->user_stack
+ *      |     16b     |
+ *      +-------------+
+ *      | STRING AREA |
+ *      |      :      |
+ *      |      :      |
+ *      |      :      |
+ *      +- -- -- -- --+
+ *      |  PATH AREA  |
+ *      +-------------+
+ *      |      0      |
+ *      +-------------+
+ *      |  applev[n]  |
+ *      +-------------+
+ *             :
+ *             :
+ *      +-------------+
+ *      |  applev[1]  |
+ *      +-------------+
+ *      | exec_path / |
+ *      |  applev[0]  |
+ *      +-------------+
+ *      |      0      |
+ *      +-------------+
+ *      |    env[n]   |
+ *      +-------------+
+ *             :
+ *             :
+ *      +-------------+
+ *      |    env[0]   |
+ *      +-------------+
+ *      |      0      |
+ *      +-------------+
+ *      | arg[argc-1] |
+ *      +-------------+
+ *             :
+ *             :
+ *      +-------------+
+ *      |    arg[0]   |
+ *      +-------------+
+ *      |     argc    |
+ * sp-> +-------------+
+ *
+ */
+static void inject_env_vars(const task_t task, const thread_t thread,
+                            const std::vector<std::string> &injected_env_vars) {
+    (void)injected_env_vars;
+    (void)read_cstr_target;
+    const auto sp = get_sp(thread);
+    fmt::print("sp: {:p}\n", (void *)sp);
+    const auto argc = read_target<int32_t>(task, sp);
+    fmt::print("argc: {:d}\n", argc);
+}
 
 static void patch_dyld(const task_t task) {
     const auto dyld_base = get_dyld_base(task);
@@ -232,7 +300,7 @@ static void inject(const audit_token_t token, const std::vector<std::string> &in
                                           sizeof(thread_act_t) * num_threads);
     mach_check(kr_dealloc, "vm_deallocate");
     patch_dyld(task);
-    inject_stack(task, thread, injected_env_vars);
+    inject_env_vars(task, thread, injected_env_vars);
 }
 
 static void es_cb(es_client_t *client, const es_message_t *message,
