@@ -236,11 +236,18 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
 static void inject_env_vars(const task_t task, const thread_t thread,
                             const std::vector<std::string> &injected_env_vars) {
     (void)injected_env_vars;
-    (void)read_cstr_target;
     const auto sp = get_sp(thread);
     fmt::print("sp: {:p}\n", (void *)sp);
-    const auto argc = read_target<int32_t>(task, sp);
+    const auto argc = read_target<int32_t>(task, sp + sizeof(uint64_t));
     fmt::print("argc: {:d}\n", argc);
+    const auto argv_addr = sp + 2 * sizeof(uint64_t);
+    // +1 for NULL terminator
+    const auto argv_buf   = read_target(task, argv_addr, (argc + 1) * sizeof(const char *));
+    const auto argv_addrs = (uint64_t *)argv_buf.data();
+    for (int32_t i = 0; i < argc; ++i) {
+        fmt::print("&argv[{:d}] = {:p}\n", i, (void *)argv_addrs[i]);
+        fmt::print("argv[{:d}] = {:s}\n", i, read_cstr_target(task, argv_addrs[i]));
+    }
 }
 
 static void patch_dyld(const task_t task) {
