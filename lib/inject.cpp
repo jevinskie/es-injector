@@ -147,15 +147,50 @@ static uint64_t get_sp(const thread_t thread) {
     arm_thread_state64_t gpr_state;
     const auto kr_thread_get_gpr =
         thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
-    mach_check(kr_thread_get_gpr, "thread_get_state sp");
+    mach_check(kr_thread_get_gpr, "thread_get_state get_sp");
     return arm_thread_state64_get_sp(gpr_state);
 #elif defined(__x86_64__)
     mach_msg_type_number_t gpr_cnt = x86_THREAD_STATE64_COUNT;
     x86_thread_state64_t gpr_state;
     const auto kr_thread_get_gpr =
         thread_get_state(thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
-    mach_check(kr_thread_get_gpr, "thread_get_state sp");
+    mach_check(kr_thread_get_gpr, "thread_get_state get_sp");
     return gpr_state.__rsp;
+#else
+#error bad arch
+#endif
+}
+
+static void set_sp(const thread_t thread, uint64_t sp) {
+#ifdef __arm64__
+    mach_msg_type_number_t gpr_cnt = ARM_THREAD_STATE64_COUNT;
+    arm_thread_state64_t gpr_state;
+    const auto kr_thread_get_gpr =
+        thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
+    mach_check(kr_thread_get_gpr, "thread_get_state set_sp");
+    gpr_cnt                       = ARM_THREAD_STATE64_COUNT;
+    const auto kr_convert_to_self = thread_convert_thread_state(
+        thread, THREAD_CONVERT_THREAD_STATE_TO_SELF, ARM_THREAD_STATE64, (thread_state_t)&gpr_state,
+        gpr_cnt, (thread_state_t)&gpr_state, &gpr_cnt);
+    mach_check(kr_convert_to_self, "thread_convert_thread_state to self set_sp");
+    arm_thread_state64_set_sp(gpr_state, sp);
+    const auto kr_convert_from_self = thread_convert_thread_state(
+        thread, THREAD_CONVERT_THREAD_STATE_FROM_SELF, ARM_THREAD_STATE64,
+        (thread_state_t)&gpr_state, gpr_cnt, (thread_state_t)&gpr_state, &gpr_cnt);
+    mach_check(kr_convert_from_self, "thread_convert_thread_state from self set_sp");
+    const auto kr_thread_set_gpr =
+        thread_set_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, gpr_cnt);
+    mach_check(kr_thread_set_gpr, "thread_set_state set_sp");
+#elif defined(__x86_64__)
+    mach_msg_type_number_t gpr_cnt = x86_THREAD_STATE64_COUNT;
+    x86_thread_state64_t gpr_state;
+    const auto kr_thread_get_gpr =
+        thread_get_state(thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
+    mach_check(kr_thread_get_gpr, "thread_get_state set_sp");
+    gpr_state.__rsp              = sp;
+    const auto kr_thread_set_gpr = thread_set_state(
+        thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, x86_THREAD_STATE64_COUNT);
+    mach_check(kr_thread_set_gpr, "thread_set_state set_sp");
 #else
 #error bad arch
 #endif
@@ -270,6 +305,10 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     DUMP(fmt::print("sp: {:p}\n", (void *)sp));
     SP_MAX(sp);
 
+    const auto unk_addr = sp;
+    const auto unk      = read_target<uint64_t>(task, unk_addr);
+    DUMP(fmt::print("unk: {:#0x}\n", unk_addr));
+
     const auto argc_addr = sp + sizeof(uint64_t);
     const auto argc      = read_target<int32_t>(task, argc_addr);
     DUMP(fmt::print("argc: {:d}\n", argc));
@@ -345,17 +384,20 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
 
-    auto ptr_buf = std::vector<uint8_t>((argc + envc + applec + 3) * sizeof(uint64_t) + 1);
-    auto ptrs    = (uint64_t *)ptr_buf.data();
-    auto ptr     = ptrs;
+    const auto num_ptrs = 2 + argc + envc + applec + 3;
+    auto ptr_buf        = std::vector<uint8_t>(num_ptrs * sizeof(uint64_t));
+    auto ptrs           = (uint64_t *)ptr_buf.data();
+    auto ptr            = ptrs;
     std::string strs;
     const auto exe_path_var_val = apple_vars.find("executable_path");
     assert(exe_path_var_val != apple_vars.cend());
     strs += cat_var(*exe_path_var_val) + "\0"s;
-    hexdump(strs.data(), strs.size());
     apple_vars.erase(exe_path_var_val);
 
-    *(int32_t *)ptr = argc;
+    *(uint64_t *)ptr = unk;
+    ++ptr;
+
+    *(int64_t *)ptr = argc;
     ++ptr;
 
     for (const auto &arg_val : args) {
@@ -387,18 +429,39 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     while (strs.size() % 16 != 0) {
         strs += "\0"s;
     }
+    const auto strs_addr = stack_addr - strs.size();
+    write_target(task, strs_addr, std::span<uint8_t>((uint8_t *)strs.data(), strs.size()));
 
+    for (int i = 2; i < num_ptrs; ++i) {
+        if (ptrs[i] == UINT64_MAX) {
+            ptrs[i] = 0;
+        } else {
+            ptrs[i] += strs_addr;
+        }
+    }
+    const auto ptrs_addr = strs_addr - ptr_buf.size();
+    write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
+    fmt::print("set_sp\n");
+    set_sp(thread, ptrs_addr);
 #undef DUMP
 }
 
-static void patch_dyld(const task_t task) {
+static bool patch_dyld(const task_t task) {
     const auto dyld_base = get_dyld_base(task);
     fmt::print("dyld_base: {:p}\n", (void *)dyld_base);
     const auto arm64 = is_arm64(task, dyld_base);
 #ifdef __arm64__
-    assert(arm64);
+    // assert(arm64);
+    if (!arm64) {
+        fmt::print("arm64 wrong arm64: {:b}\n", arm64);
+        return false;
+    }
 #else
-    assert(!arm64);
+    // assert(!arm64);
+    if (arm64) {
+        fmt::print("x86_64 wrong arm64: {:b}\n", arm64);
+        return false;
+    }
 #endif
     uint64_t amfi_check_dyld_policy_self_addr =
         get_amfi_check_dyld_policy_self_addr(task, dyld_base);
@@ -431,9 +494,10 @@ static void patch_dyld(const task_t task) {
     const auto kr_prot_rx =
         vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
     mach_check(kr_prot_rx, "vm_protect RX");
+    return true;
 }
 
-static void inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars,
+static bool inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars,
                    const bool dump) {
     const auto pid = audit_token_to_pid(token);
     assert(pid);
@@ -448,8 +512,12 @@ static void inject(const audit_token_t token, const std::vector<std::string> &in
     const auto kr_dealloc = vm_deallocate(mach_task_self(), (vm_address_t)thread_list,
                                           sizeof(thread_act_t) * num_threads);
     mach_check(kr_dealloc, "vm_deallocate");
-    patch_dyld(task);
+    const auto patch_ok = patch_dyld(task);
+    if (!patch_ok) {
+        return false;
+    }
     inject_env_vars(task, thread, injected_env_vars, dump);
+    return true;
 }
 
 static void es_cb(es_client_t *client, const es_message_t *message,
@@ -459,7 +527,8 @@ static void es_cb(es_client_t *client, const es_message_t *message,
     case ES_EVENT_TYPE_AUTH_EXEC: {
         const auto path = std::string(message->event.exec.target->executable->path.data);
         if (target_executables.contains(path)) {
-            fmt::print("found target\n");
+            std::filesystem::path p(path);
+            fmt::print("found target: {:s}\n", p.filename().string());
             inject(message->process->audit_token, injected_env_vars, dump);
         }
         es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
