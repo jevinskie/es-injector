@@ -11,6 +11,7 @@
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
+#include <map>
 #include <set>
 #include <span>
 
@@ -27,7 +28,7 @@ static void mach_check(kern_return_t kr, const std::string &msg) {
 }
 
 // https://gist.github.com/ccbrown/9722406
-static void hexdump(const void *data, size_t size) {
+__attribute__((unused)) static void hexdump(const void *data, size_t size) {
     char ascii[17];
     size_t i, j;
     ascii[16] = '\0';
@@ -85,7 +86,7 @@ static std::vector<uint8_t> read_target(const task_t task, uint64_t addr, uint64
 
 template <typename T> static T read_target(const task_t task, uint64_t addr) {
     const auto buf = read_target(task, addr, sizeof(T));
-    hexdump(buf.data(), buf.size());
+    // hexdump(buf.data(), buf.size());
     return *(T *)buf.data();
 }
 
@@ -187,6 +188,14 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
     assert(!"symtab not found");
 }
 
+std::pair<std::string, std::string> split_var(const std::string var_val) {
+    const auto delim = var_val.find('=');
+    assert(delim != std::string::npos);
+    const auto var = var_val.substr(0, delim);
+    const auto val = var_val.substr(delim + 1);
+    return std::make_pair(var, val);
+}
+
 /* bsd/kern/kern_exec.c: exec_copyout_strings
  *
  *      +-------------+ <- p->user_stack
@@ -234,20 +243,97 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
  *
  */
 static void inject_env_vars(const task_t task, const thread_t thread,
-                            const std::vector<std::string> &injected_env_vars) {
-    (void)injected_env_vars;
+                            const std::vector<std::string> &injected_env_vars, const bool dump) {
+    std::vector<std::string> args;
+    std::map<std::string, std::string> env_vars;
+    std::map<std::string, std::string> apple_vars;
+    uint64_t max_stack_addr = 0;
+
+#define DUMP(expr)                                                                                 \
+    do {                                                                                           \
+        if (dump) {                                                                                \
+            expr;                                                                                  \
+        }                                                                                          \
+    } while (0)
+#define SP_MAX(expr)                                                                               \
+    do {                                                                                           \
+        max_stack_addr = std::max(max_stack_addr, (expr));                                         \
+    } while (0)
+
     const auto sp = get_sp(thread);
-    fmt::print("sp: {:p}\n", (void *)sp);
-    const auto argc = read_target<int32_t>(task, sp + sizeof(uint64_t));
-    fmt::print("argc: {:d}\n", argc);
-    const auto argv_addr = sp + 2 * sizeof(uint64_t);
+    DUMP(fmt::print("sp: {:p}\n", (void *)sp));
+    SP_MAX(sp);
+
+    const auto argc_addr = sp + sizeof(uint64_t);
+    const auto argc      = read_target<int32_t>(task, argc_addr);
+    DUMP(fmt::print("argc: {:d}\n", argc));
+    SP_MAX(argc_addr);
+
+    const auto argv_addr = argc_addr + sizeof(int64_t);
+    SP_MAX(argv_addr);
     // +1 for NULL terminator
-    const auto argv_buf   = read_target(task, argv_addr, (argc + 1) * sizeof(const char *));
+    const auto argv_buf = read_target(task, argv_addr, (argc + 1) * sizeof(const char *));
+    SP_MAX(argv_addr + (argc + 1) * sizeof(const char *));
     const auto argv_addrs = (uint64_t *)argv_buf.data();
     for (int32_t i = 0; i < argc; ++i) {
-        fmt::print("&argv[{:d}] = {:p}\n", i, (void *)argv_addrs[i]);
-        fmt::print("argv[{:d}] = {:s}\n", i, read_cstr_target(task, argv_addrs[i]));
+        SP_MAX(argv_addrs[i]);
+        const auto arg_val = read_cstr_target(task, argv_addrs[i]);
+        SP_MAX(argv_addrs[i] + arg_val.size() + 1);
+        DUMP(fmt::print("argv[{:d}] = {:s}\n", i, arg_val));
+        args.emplace_back(arg_val);
     }
+
+    const auto envp_addr = argv_addr + (argc + 1) * sizeof(const char *);
+    SP_MAX(envp_addr);
+    int envc = -1;
+    for (int i = 0; true; ++i) {
+        const auto envp_ptr = read_target<uint64_t>(task, envp_addr + i * sizeof(uint64_t));
+        SP_MAX(envp_ptr);
+        if (envp_ptr == 0) {
+            envc = i;
+            break;
+        }
+        const auto env_var = read_cstr_target(task, envp_ptr);
+        SP_MAX(envp_ptr + env_var.size() + 1);
+        DUMP(fmt::print("envp[{:d}] = {:s}\n", i, env_var));
+        env_vars.emplace(split_var(env_var));
+    }
+    assert(envc >= 0);
+
+    const auto apple_addr = envp_addr + (envc + 1) * sizeof(const char *);
+    SP_MAX(apple_addr);
+    int applec = -1;
+    for (int i = 0; true; ++i) {
+        const auto apple_ptr = read_target<uint64_t>(task, apple_addr + i * sizeof(uint64_t));
+        SP_MAX(apple_ptr);
+        if (apple_ptr == 0) {
+            applec = i;
+            break;
+        }
+        const auto apple_var = read_cstr_target(task, apple_ptr);
+        SP_MAX(apple_ptr + apple_var.size() + 1);
+        DUMP(fmt::print("apple[{:d}] = {:s}\n", i, apple_var));
+        apple_vars.emplace(split_var(apple_var));
+    }
+
+    const auto max_stack_addr_aligned = roundup_pow2_mul(max_stack_addr, sizeof(uint64_t));
+
+    const auto main_stack_pair = apple_vars.find("main_stack");
+    assert(main_stack_pair != apple_vars.cend());
+    const auto main_stack_val = main_stack_pair->second;
+    const auto stack_delim    = main_stack_val.find(',');
+    assert(stack_delim != std::string::npos);
+    const auto stack_addr_str = main_stack_val.substr(0, stack_delim);
+    const auto stack_addr     = strtoull(stack_addr_str.c_str(), nullptr, 16);
+    assert(stack_addr == max_stack_addr_aligned);
+    DUMP(fmt::print("stack_addr: {:p}\n", (void *)stack_addr));
+
+    for (const auto &env_var : injected_env_vars) {
+        auto p = split_var(env_var);
+        env_vars.insert_or_assign(p.first, p.second);
+        DUMP(fmt::print("injecting {:s} = {:s}\n", p.first, p.second));
+    }
+#undef DUMP
 }
 
 static void patch_dyld(const task_t task) {
@@ -292,7 +378,8 @@ static void patch_dyld(const task_t task) {
     mach_check(kr_prot_rx, "vm_protect RX");
 }
 
-static void inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars) {
+static void inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars,
+                   const bool dump) {
     const auto pid = audit_token_to_pid(token);
     assert(pid);
     task_t task = MACH_PORT_NULL;
@@ -307,18 +394,18 @@ static void inject(const audit_token_t token, const std::vector<std::string> &in
                                           sizeof(thread_act_t) * num_threads);
     mach_check(kr_dealloc, "vm_deallocate");
     patch_dyld(task);
-    inject_env_vars(task, thread, injected_env_vars);
+    inject_env_vars(task, thread, injected_env_vars, dump);
 }
 
 static void es_cb(es_client_t *client, const es_message_t *message,
                   const std::vector<std::string> &injected_env_vars,
-                  const std::set<std::string> &target_executables) {
+                  const std::set<std::string> &target_executables, const bool dump) {
     switch (message->event_type) {
     case ES_EVENT_TYPE_AUTH_EXEC: {
         const auto path = std::string(message->event.exec.target->executable->path.data);
         if (target_executables.contains(path)) {
             fmt::print("found target\n");
-            inject(message->process->audit_token, injected_env_vars);
+            inject(message->process->audit_token, injected_env_vars, dump);
         }
         es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
         break;
@@ -329,12 +416,12 @@ static void es_cb(es_client_t *client, const es_message_t *message,
 }
 
 void run_injector(const std::vector<std::string> &injected_env_vars,
-                  const std::vector<std::string> &target_executables) {
+                  const std::vector<std::string> &target_executables, const bool dump) {
     std::set<std::string> exes(target_executables.cbegin(), target_executables.cend());
     es_client_t *client = nullptr;
     auto new_client_res =
         es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
-            es_cb(client, message, injected_env_vars, exes);
+            es_cb(client, message, injected_env_vars, exes, dump);
         });
     assert(client && new_client_res == ES_NEW_CLIENT_RESULT_SUCCESS);
     es_event_type_t events[] = {ES_EVENT_TYPE_AUTH_EXEC};
