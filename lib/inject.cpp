@@ -17,6 +17,8 @@
 
 #include <fmt/format.h>
 
+using namespace std::string_literals;
+
 constexpr uint32_t PAGE_SZ_4K = 4096;
 
 static void mach_check(kern_return_t kr, const std::string &msg) {
@@ -196,6 +198,10 @@ std::pair<std::string, std::string> split_var(const std::string var_val) {
     return std::make_pair(var, val);
 }
 
+std::string cat_var(const std::pair<std::string, std::string> &var_val) {
+    return var_val.first + "=" + var_val.second;
+}
+
 /* bsd/kern/kern_exec.c: exec_copyout_strings
  *
  *      +-------------+ <- p->user_stack
@@ -329,10 +335,59 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     DUMP(fmt::print("stack_addr: {:p}\n", (void *)stack_addr));
 
     for (const auto &env_var : injected_env_vars) {
-        auto p = split_var(env_var);
-        env_vars.insert_or_assign(p.first, p.second);
-        DUMP(fmt::print("injecting {:s} = {:s}\n", p.first, p.second));
+        auto p              = split_var(env_var);
+        const auto r        = env_vars.insert_or_assign(p.first, p.second);
+        const auto override = !r.second;
+        DUMP(fmt::print("{:s} {:s} = {:s}\n", override ? "overriding" : "inserting", p.first,
+                        p.second));
+        if (!override) {
+            ++envc;
+        }
     }
+
+    auto ptr_buf = std::vector<uint8_t>((argc + envc + applec + 3) * sizeof(uint64_t) + 1);
+    auto ptrs    = (uint64_t *)ptr_buf.data();
+    auto ptr     = ptrs;
+    std::string strs;
+    const auto exe_path_var_val = apple_vars.find("executable_path");
+    assert(exe_path_var_val != apple_vars.cend());
+    strs += cat_var(*exe_path_var_val) + "\0"s;
+    hexdump(strs.data(), strs.size());
+    apple_vars.erase(exe_path_var_val);
+
+    *(int32_t *)ptr = argc;
+    ++ptr;
+
+    for (const auto &arg_val : args) {
+        const auto str_idx = strs.size();
+        *ptr               = str_idx;
+        ++ptr;
+        strs += arg_val + "\0"s;
+    }
+    *ptr = UINT64_MAX;
+    ++ptr;
+    for (const auto &env_var_val : env_vars) {
+        const auto str_idx = strs.size();
+        *ptr               = str_idx;
+        ++ptr;
+        strs += cat_var(env_var_val) + "\0"s;
+    }
+    *ptr = UINT64_MAX;
+    ++ptr;
+    *ptr = 0; // executable_path
+    ++ptr;
+    for (const auto &apple_var_val : apple_vars) {
+        const auto str_idx = strs.size();
+        *ptr               = str_idx;
+        ++ptr;
+        strs += cat_var(apple_var_val) + "\0"s;
+    }
+    *ptr = UINT64_MAX;
+    ++ptr;
+    while (strs.size() % 16 != 0) {
+        strs += "\0"s;
+    }
+
 #undef DUMP
 }
 
