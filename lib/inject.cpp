@@ -14,6 +14,7 @@
 #include <map>
 #include <set>
 #include <span>
+#include <sys/ptrace.h>
 
 #include <fmt/format.h>
 
@@ -148,7 +149,13 @@ static uint64_t get_sp(const thread_t thread) {
     const auto kr_thread_get_gpr =
         thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
     mach_check(kr_thread_get_gpr, "thread_get_state get_sp");
-    return arm_thread_state64_get_sp(gpr_state);
+    arm_thread_state64_t our_gpr_state;
+    mach_msg_type_number_t our_gpr_cnt = ARM_THREAD_STATE64_COUNT;
+    const auto kr_convert_to_self      = thread_convert_thread_state(
+        thread, THREAD_CONVERT_THREAD_STATE_TO_SELF, ARM_THREAD_STATE64, (thread_state_t)&gpr_state,
+        gpr_cnt, (thread_state_t)&our_gpr_state, &our_gpr_cnt);
+    mach_check(kr_convert_to_self, "thread_convert_thread_state to self get_sp");
+    return arm_thread_state64_get_sp(our_gpr_state);
 #elif defined(__x86_64__)
     mach_msg_type_number_t gpr_cnt = x86_THREAD_STATE64_COUNT;
     x86_thread_state64_t gpr_state;
@@ -161,25 +168,34 @@ static uint64_t get_sp(const thread_t thread) {
 #endif
 }
 
-static void set_sp(const thread_t thread, uint64_t sp) {
+__attribute__((noinline)) static void set_sp(const thread_t thread, uint64_t sp) {
 #ifdef __arm64__
     mach_msg_type_number_t gpr_cnt = ARM_THREAD_STATE64_COUNT;
     arm_thread_state64_t gpr_state;
     const auto kr_thread_get_gpr =
         thread_get_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
     mach_check(kr_thread_get_gpr, "thread_get_state set_sp");
-    gpr_cnt                       = ARM_THREAD_STATE64_COUNT;
-    const auto kr_convert_to_self = thread_convert_thread_state(
+    arm_thread_state64_t our_gpr_state;
+    mach_msg_type_number_t our_gpr_cnt = ARM_THREAD_STATE64_COUNT;
+    const auto kr_convert_to_self      = thread_convert_thread_state(
         thread, THREAD_CONVERT_THREAD_STATE_TO_SELF, ARM_THREAD_STATE64, (thread_state_t)&gpr_state,
-        gpr_cnt, (thread_state_t)&gpr_state, &gpr_cnt);
+        gpr_cnt, (thread_state_t)&our_gpr_state, &our_gpr_cnt);
     mach_check(kr_convert_to_self, "thread_convert_thread_state to self set_sp");
-    arm_thread_state64_set_sp(gpr_state, sp);
-    const auto kr_convert_from_self = thread_convert_thread_state(
-        thread, THREAD_CONVERT_THREAD_STATE_FROM_SELF, ARM_THREAD_STATE64,
-        (thread_state_t)&gpr_state, gpr_cnt, (thread_state_t)&gpr_state, &gpr_cnt);
+    arm_thread_state64_set_sp(our_gpr_state, sp);
+#if !__has_feature(ptrauth_calls)
+    // gpr_state.__sp = sp;
+#else
+    // gpr_state.__opaque_sp = (void *)sp;
+#endif
+    arm_thread_state64_t their_gpr_state;
+    mach_msg_type_number_t their_gpr_cnt = ARM_THREAD_STATE64_COUNT;
+    const auto kr_convert_from_self =
+        thread_convert_thread_state(thread, THREAD_CONVERT_THREAD_STATE_FROM_SELF,
+                                    ARM_THREAD_STATE64, (thread_state_t)&our_gpr_state, our_gpr_cnt,
+                                    (thread_state_t)&their_gpr_state, &their_gpr_cnt);
     mach_check(kr_convert_from_self, "thread_convert_thread_state from self set_sp");
-    const auto kr_thread_set_gpr =
-        thread_set_state(thread, ARM_THREAD_STATE64, (thread_state_t)&gpr_state, gpr_cnt);
+    const auto kr_thread_set_gpr = thread_set_state(
+        thread, ARM_THREAD_STATE64, (thread_state_t)&their_gpr_state, their_gpr_cnt);
     mach_check(kr_thread_set_gpr, "thread_set_state set_sp");
 #elif defined(__x86_64__)
     mach_msg_type_number_t gpr_cnt = x86_THREAD_STATE64_COUNT;
@@ -302,7 +318,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     } while (0)
 
     const auto sp = get_sp(thread);
-    DUMP(fmt::print("sp: {:p}\n", (void *)sp));
+    fmt::print("old sp: {:p}\n", (void *)sp);
     SP_MAX(sp);
 
     const auto unk_addr = sp;
@@ -384,10 +400,11 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
 
-    const auto num_ptrs = 2 + argc + envc + applec + 3;
-    auto ptr_buf        = std::vector<uint8_t>(num_ptrs * sizeof(uint64_t));
-    auto ptrs           = (uint64_t *)ptr_buf.data();
-    auto ptr            = ptrs;
+    const auto num_ptrs     = 2 + argc + envc + applec + 3;
+    const auto num_pad_ptrs = num_ptrs % 2 ? 1 : 0;
+    auto ptr_buf            = std::vector<uint8_t>((num_ptrs + num_pad_ptrs) * sizeof(uint64_t));
+    auto ptrs               = (uint64_t *)ptr_buf.data();
+    auto ptr                = ptrs;
     std::string strs;
     const auto exe_path_var_val = apple_vars.find("executable_path");
     assert(exe_path_var_val != apple_vars.cend());
@@ -441,7 +458,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     }
     const auto ptrs_addr = strs_addr - ptr_buf.size();
     write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
-    fmt::print("set_sp\n");
+    fmt::print("new sp: {:p}\n", (void *)ptrs_addr);
     set_sp(thread, ptrs_addr);
 #undef DUMP
 }
@@ -501,6 +518,7 @@ static bool inject(const audit_token_t token, const std::vector<std::string> &in
                    const bool dump) {
     const auto pid = audit_token_to_pid(token);
     assert(pid);
+    // assert(!ptrace(PT_ATTACHEXC, pid, nullptr, 0));
     task_t task = MACH_PORT_NULL;
     mach_check(task_for_pid(mach_task_self(), pid, &task), "tfp");
     thread_act_array_t thread_list;
