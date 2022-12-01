@@ -5,22 +5,41 @@
 #undef NDEBUG
 #include <cassert>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <dispatch/dispatch.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <filesystem>
 #include <mach-o/dyld_images.h>
 #include <mach-o/loader.h>
 #include <mach-o/nlist.h>
 #include <mach/mach.h>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
 #include <sys/ptrace.h>
+#include <sys/syslimits.h>
+#include <tuple>
 
+#include <BS_thread_pool.hpp>
 #include <fmt/format.h>
 
 using namespace std::string_literals;
+namespace fs = std::filesystem;
 
-constexpr uint32_t PAGE_SZ_4K = 4096;
+constexpr uint32_t PAGE_SZ_4K  = 4096;
+constexpr uint32_t PAGE_SZ_16K = 16 * 1024;
+
+template <> struct fmt::formatter<fs::path> {
+    template <typename ParseContext> constexpr auto parse(ParseContext &ctx) {
+        return ctx.begin();
+    }
+    template <typename FormatContext> auto format(const fs::path &path, FormatContext &ctx) {
+        return fmt::format_to(ctx.out(), "{:s}", path.string());
+    }
+};
 
 static void mach_check(kern_return_t kr, const std::string &msg) {
     if (kr != KERN_SUCCESS) {
@@ -28,6 +47,13 @@ static void mach_check(kern_return_t kr, const std::string &msg) {
                    mach_error_string(kr));
         exit(-1);
     }
+}
+
+static void checked_system(const std::vector<std::string> &argv) {
+    const auto cmd = fmt::format("{}", fmt::join(argv, " "));
+    fmt::print("cmd: {:s}\n", cmd);
+    const auto res = system(cmd.c_str());
+    assert(!res);
 }
 
 // https://gist.github.com/ccbrown/9722406
@@ -114,6 +140,70 @@ static std::string read_cstr_target(const task_t task, uint64_t addr) {
 static bool is_macho_magic_at(const task_t task, uint64_t addr) {
     const auto macho_magic_buf = read_target(task, addr, 4);
     return *(uint32_t *)macho_magic_buf.data() == MH_MAGIC_64;
+}
+
+// static std::tuple<FILE *, fs::path> get_tmpfile(const std::string &prefix,
+//                                                 const std::string &ext = "") {
+static std::tuple<FILE *, fs::path> get_tmpfile(const std::string &prefix, const char *mode) {
+    const auto tmp_path = fmt::format("/tmp/{:s}.XXXXXX", prefix);
+    const auto fd       = mkstemp((char *)tmp_path.c_str());
+    assert(fd >= 0);
+    auto fh = fdopen(fd, mode);
+    assert(fh);
+    assert(!fchmod(fd, 1053 /* 0o555 */));
+    return {fh, fs::path(tmp_path)};
+}
+
+static fs::path make_patch_dylib(const std::vector<uint8_t> &buf) {
+    const auto [bin_fh, bin_path] = get_tmpfile("patch_dyld_bin", "wb");
+    assert(fwrite(buf.data(), buf.size(), 1, bin_fh) == 1);
+    assert(!fflush(bin_fh));
+    assert(!fsync(fileno(bin_fh)));
+    const auto [asm_fh, asm_path] = get_tmpfile("patch_dyld_asm", "w");
+    const auto asm_str            = fmt::format(R"(
+.section __TEXT,__text
+.align 14
+.global _patched_dyld_amfi_page
+_patched_dyld_amfi_page:
+    .incbin "{:s}"
+)",
+                                                bin_path.string());
+    fmt::print(asm_fh, "{:s}", asm_str);
+    fmt::print("asm:\n{:s}\n", asm_str);
+    fmt::print("asm_path: {}\n", asm_path);
+    assert(!fflush(asm_fh));
+    assert(!fsync(fileno(asm_fh)));
+    const auto [dylib_fh, dylib_path] = get_tmpfile("patch_dyld_dylib", "wb");
+    (void)dylib_fh;
+    checked_system({
+        "clang",
+        "-arch",
+#ifdef __arm64__
+#ifndef __arm64e__
+        "arm64",
+#else
+        "arm64e",
+#endif
+#elif defined(__x86_64__)
+        "x86_64",
+#else
+#error bad arch
+#endif
+        "-x",
+        "assembler-with-cpp",
+        "-shared",
+        "-o",
+        dylib_path.string(),
+        asm_path.string(),
+    });
+    // fclose(asm_fh);
+    return dylib_path;
+}
+
+static void remap_patch_dylib(const task_t task, const uint64_t patch_page_addr,
+                              const fs::path &dylib_path) {
+    const auto dylib_handle = dlopen(dylib_path.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
+    assert(dlopen);
 }
 
 static uint64_t get_dyld_base(const task_t task) {
@@ -203,7 +293,7 @@ __attribute__((noinline)) static void set_sp(const thread_t thread, uint64_t sp)
     const auto kr_thread_get_gpr =
         thread_get_state(thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, &gpr_cnt);
     mach_check(kr_thread_get_gpr, "thread_get_state set_sp");
-    gpr_state.__rsp              = sp;
+    gpr_state.__rsp = sp;
     const auto kr_thread_set_gpr = thread_set_state(
         thread, x86_THREAD_STATE64, (thread_state_t)&gpr_state, x86_THREAD_STATE64_COUNT);
     mach_check(kr_thread_set_gpr, "thread_set_state set_sp");
@@ -447,7 +537,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         strs += "\0"s;
     }
     const auto strs_addr = stack_addr - strs.size();
-    write_target(task, strs_addr, std::span<uint8_t>((uint8_t *)strs.data(), strs.size()));
+    // write_target(task, strs_addr, std::span<uint8_t>((uint8_t *)strs.data(), strs.size()));
 
     for (int i = 2; i < num_ptrs; ++i) {
         if (ptrs[i] == UINT64_MAX) {
@@ -457,9 +547,9 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
     const auto ptrs_addr = strs_addr - ptr_buf.size();
-    write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
+    // write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
     fmt::print("new sp: {:p}\n", (void *)ptrs_addr);
-    set_sp(thread, ptrs_addr);
+    // set_sp(thread, ptrs_addr);
 #undef DUMP
 }
 
@@ -480,7 +570,7 @@ static bool patch_dyld(const task_t task) {
         return false;
     }
 #endif
-    uint64_t amfi_check_dyld_policy_self_addr =
+    const auto amfi_check_dyld_policy_self_addr =
         get_amfi_check_dyld_policy_self_addr(task, dyld_base);
     fmt::print("amfi_check_dyld_policy_self: {:p}\n", (void *)amfi_check_dyld_policy_self_addr);
     // int amfi_check_dyld_policy_self_patched(uint64_t inFlags, uint64_t* outFlags) {
@@ -502,21 +592,29 @@ static bool patch_dyld(const task_t task) {
 #else
 #error bad arch
 #endif
-    const auto patch_page_addr = rounddown_pow2_mul(amfi_check_dyld_policy_self_addr, PAGE_SZ_4K);
-    const auto kr_prot_rw      = vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0,
-                                            VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    mach_check(kr_prot_rw, "vm_protect RW");
-    write_target(task, amfi_check_dyld_policy_self_addr,
-                 std::span<const uint8_t>(patch, sizeof(patch)));
-    const auto kr_prot_rx =
-        vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-    mach_check(kr_prot_rx, "vm_protect RX");
+
+    const auto patch_page_addr = rounddown_pow2_mul(amfi_check_dyld_policy_self_addr, PAGE_SZ_16K);
+    auto patch_page_buf        = read_target(task, patch_page_addr, PAGE_SZ_16K);
+    const auto patch_page_off  = amfi_check_dyld_policy_self_addr - patch_page_addr;
+    std::copy(patch, patch + sizeof(patch), &patch_page_buf.data()[patch_page_off]);
+    const auto patch_dylib_path = make_patch_dylib(patch_page_buf);
+    remap_patch_dylib(task, patch_page_addr, patch_dylib_path);
     return true;
+
+    // const auto kr_prot_rw      = vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0,
+    //                                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    // mach_check(kr_prot_rw, "vm_protect RW");
+    // write_target(task, amfi_check_dyld_policy_self_addr,
+    //              std::span<const uint8_t>(patch, sizeof(patch)));
+    // const auto kr_prot_rx =
+    //     vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+    // mach_check(kr_prot_rx, "vm_protect RX");
+    // return true;
 }
 
-static bool inject(const audit_token_t token, const std::vector<std::string> &injected_env_vars,
-                   const bool dump) {
-    const auto pid = audit_token_to_pid(token);
+static bool inject(es_client_t *client, const es_message_t *message,
+                   const std::vector<std::string> &injected_env_vars, const bool dump) {
+    const auto pid = audit_token_to_pid(message->process->audit_token);
     assert(pid);
     // assert(!ptrace(PT_ATTACHEXC, pid, nullptr, 0));
     task_t task = MACH_PORT_NULL;
@@ -531,25 +629,32 @@ static bool inject(const audit_token_t token, const std::vector<std::string> &in
                                           sizeof(thread_act_t) * num_threads);
     mach_check(kr_dealloc, "vm_deallocate");
     const auto patch_ok = patch_dyld(task);
+    // const auto patch_ok = true;
     if (!patch_ok) {
+        fmt::print("patch failed\n");
         return false;
     }
+    fmt::print("injecting env vars\n");
     inject_env_vars(task, thread, injected_env_vars, dump);
+    fmt::print("injecting env vars done\n");
+    es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
     return true;
 }
 
 static void es_cb(es_client_t *client, const es_message_t *message,
                   const std::vector<std::string> &injected_env_vars,
-                  const std::set<std::string> &target_executables, const bool dump) {
+                  const std::set<std::string> &target_executables, BS::thread_pool *thread_pool,
+                  bool dump) {
     switch (message->event_type) {
     case ES_EVENT_TYPE_AUTH_EXEC: {
         const auto path = std::string(message->event.exec.target->executable->path.data);
         if (target_executables.contains(path)) {
             std::filesystem::path p(path);
             fmt::print("found target: {:s}\n", p.filename().string());
-            inject(message->process->audit_token, injected_env_vars, dump);
+            thread_pool->push_task(inject, client, message, injected_env_vars, dump);
+        } else {
+            es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
         }
-        es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
         break;
     }
     default:
@@ -560,10 +665,12 @@ static void es_cb(es_client_t *client, const es_message_t *message,
 void run_injector(const std::vector<std::string> &injected_env_vars,
                   const std::vector<std::string> &target_executables, const bool dump) {
     std::set<std::string> exes(target_executables.cbegin(), target_executables.cend());
-    es_client_t *client = nullptr;
+    es_client_t *client                          = nullptr;
+    std::unique_ptr<BS::thread_pool> thread_pool = std::make_unique<BS::thread_pool>();
+    const auto tp                                = thread_pool.get();
     auto new_client_res =
         es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
-            es_cb(client, message, injected_env_vars, exes, dump);
+            es_cb(client, message, injected_env_vars, exes, tp, dump);
         });
     assert(client && new_client_res == ES_NEW_CLIENT_RESULT_SUCCESS);
     es_event_type_t events[] = {ES_EVENT_TYPE_AUTH_EXEC};
