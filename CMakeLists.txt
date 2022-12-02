@@ -15,7 +15,7 @@ add_compile_options(-O0 -fno-omit-frame-pointer)
 # add_link_options(-Os -Wl,-dead_strip)
 
 set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_EXTENSIONS NO)
+set(CMAKE_CXX_EXTENSIONS YES)
 
 add_subdirectory(3rdparty)
 add_subdirectory(lib)

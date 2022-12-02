@@ -22,6 +22,9 @@
 #include <sys/ptrace.h>
 #include <sys/syslimits.h>
 #include <tuple>
+#if __has_include(<ptrauth.h>)
+#include <ptrauth.h>
+#endif
 
 #include <BS_thread_pool.hpp>
 #include <fmt/format.h>
@@ -158,7 +161,6 @@ static fs::path make_patch_dylib(const std::vector<uint8_t> &buf) {
     const auto [bin_fh, bin_path] = get_tmpfile("patch_dyld_bin", "wb");
     assert(fwrite(buf.data(), buf.size(), 1, bin_fh) == 1);
     assert(!fflush(bin_fh));
-    assert(!fsync(fileno(bin_fh)));
     const auto [asm_fh, asm_path] = get_tmpfile("patch_dyld_asm", "w");
     const auto asm_str            = fmt::format(R"(
 .section __TEXT,__text
@@ -172,7 +174,6 @@ _patched_dyld_amfi_page:
     fmt::print("asm:\n{:s}\n", asm_str);
     fmt::print("asm_path: {}\n", asm_path);
     assert(!fflush(asm_fh));
-    assert(!fsync(fileno(asm_fh)));
     const auto [dylib_fh, dylib_path] = get_tmpfile("patch_dyld_dylib", "wb");
     (void)dylib_fh;
     checked_system({
@@ -203,7 +204,26 @@ _patched_dyld_amfi_page:
 static void remap_patch_dylib(const task_t task, const uint64_t patch_page_addr,
                               const fs::path &dylib_path) {
     const auto dylib_handle = dlopen(dylib_path.string().c_str(), RTLD_NOW | RTLD_GLOBAL);
-    assert(dlopen);
+    assert(dylib_handle);
+    const auto our_patch_page_ptr = dlsym(dylib_handle, "patched_dyld_amfi_page");
+    assert(our_patch_page_ptr);
+#if !__has_feature(ptrauth_calls)
+    const auto our_patch_page_addr = (uint64_t)our_patch_page_ptr;
+#else
+    const auto our_patch_page_addr =
+        (uint64_t)ptrauth_strip(our_patch_page_ptr, ptrauth_key_process_independent_code);
+#endif
+    fmt::print("our_patch_page_addr: {:p}\n", (void *)our_patch_page_addr);
+    vm_prot_t cur_prot         = VM_PROT_NONE;
+    vm_prot_t max_prot         = VM_PROT_NONE;
+    vm_address_t remapped_addr = patch_page_addr;
+    const auto kr_remap =
+        vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0,
+                 VM_FLAGS_ANYWHERE | VM_FLAGS_RETURN_DATA_ADDR, mach_task_self(),
+                 (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+    fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
+               cur_prot, max_prot);
+    mach_check(kr_remap, "vm_remap");
 }
 
 static uint64_t get_dyld_base(const task_t task) {
@@ -537,7 +557,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         strs += "\0"s;
     }
     const auto strs_addr = stack_addr - strs.size();
-    // write_target(task, strs_addr, std::span<uint8_t>((uint8_t *)strs.data(), strs.size()));
+    write_target(task, strs_addr, std::span<uint8_t>((uint8_t *)strs.data(), strs.size()));
 
     for (int i = 2; i < num_ptrs; ++i) {
         if (ptrs[i] == UINT64_MAX) {
@@ -547,9 +567,9 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
     const auto ptrs_addr = strs_addr - ptr_buf.size();
-    // write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
+    write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
     fmt::print("new sp: {:p}\n", (void *)ptrs_addr);
-    // set_sp(thread, ptrs_addr);
+    set_sp(thread, ptrs_addr);
 #undef DUMP
 }
 
