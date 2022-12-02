@@ -220,14 +220,12 @@ static void remap_patch_dylib(const task_t task, const uint64_t patch_page_addr,
     vm_prot_t cur_prot         = VM_PROT_NONE;
     vm_prot_t max_prot         = VM_PROT_NONE;
     vm_address_t remapped_addr = patch_page_addr;
-    // const auto kr_remap =
-    //     vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0, VM_FLAGS_RETURN_DATA_ADDR,
-    //     mach_task_self(),
-    //              (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot,
-    //              VM_INHERIT_NONE);
-    // fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
-    //            cur_prot, max_prot);
-    // mach_check(kr_remap, "vm_remap");
+    const auto kr_remap =
+        vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0, VM_FLAGS_RETURN_DATA_ADDR, mach_task_self(),
+                 (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+    fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
+               cur_prot, max_prot);
+    mach_check(kr_remap, "vm_remap");
 }
 
 static uint64_t get_dyld_base(const task_t task) {
@@ -629,35 +627,53 @@ static bool patch_dyld(const task_t task) {
     // str x8, [x1]
     // mov w0, #0
     // ret
-    // const uint8_t patch[] = {0x08, 0x00, 0x80, 0x92, 0x28, 0x00, 0x00, 0xf9,
-    //                          0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
-    const uint8_t patch[] = {0x20, 0x00, 0x20, 0xd4};
+    const uint8_t patch[] = {0x08, 0x00, 0x80, 0x92, 0x28, 0x00, 0x00, 0xf9,
+                             0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+    // brk #1
+    const uint8_t breakpoint[] = {0x20, 0x00, 0x20, 0xd4};
+    // nop
+    const uint8_t nop[] = {0x1f, 0x20, 0x03, 0xd5};
 #elif defined(__x86_64__)
     // or qword ptr [rsi], -1
     // xor eax, eax
     // ret
     const uint8_t patch[] = {0x48, 0x83, 0x0e, 0xff, 0x31, 0xc0, 0xc3};
+    // ud2
+    const uint8_t breakpoint[] = {0x0f, 0x0b};
+    // nop
+    const uint8_t nop[] = {0x90};
 #else
 #error bad arch
 #endif
 
     const auto patch_page_addr = rounddown_pow2_mul(amfi_check_dyld_policy_self_addr, PAGE_SZ_16K);
     auto patch_page_buf        = read_target(task, patch_page_addr, PAGE_SZ_16K);
-    const auto patch_page_off  = amfi_check_dyld_policy_self_addr - patch_page_addr;
-    std::copy(patch, patch + sizeof(patch), &patch_page_buf.data()[patch_page_off]);
+    if (false) {
+        const auto patch_page_off = amfi_check_dyld_policy_self_addr - patch_page_addr;
+        std::copy(patch, patch + sizeof(patch), &patch_page_buf.data()[patch_page_off]);
+    } else {
+        for (unsigned int off = 0; off < patch_page_buf.size() - sizeof(breakpoint);
+             off += sizeof(nop)) {
+            std::copy(nop, nop + sizeof(nop), patch_page_buf.data() + off);
+        }
+        std::copy(breakpoint, breakpoint + sizeof(breakpoint),
+                  patch_page_buf.data() + patch_page_buf.size() - sizeof(breakpoint));
+    }
     const auto patch_dylib_path = make_patch_dylib(patch_page_buf);
     remap_patch_dylib(task, patch_page_addr, patch_dylib_path);
     return true;
 
-    // const auto kr_prot_rw      = vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0,
-    //                                         VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    // mach_check(kr_prot_rw, "vm_protect RW");
-    // write_target(task, amfi_check_dyld_policy_self_addr,
-    //              std::span<const uint8_t>(patch, sizeof(patch)));
-    // const auto kr_prot_rx =
-    //     vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
-    // mach_check(kr_prot_rx, "vm_protect RX");
-    // return true;
+    if (false) {
+        const auto kr_prot_rw = vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0,
+                                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+        mach_check(kr_prot_rw, "vm_protect RW");
+        write_target(task, amfi_check_dyld_policy_self_addr,
+                     std::span<const uint8_t>(patch, sizeof(patch)));
+        const auto kr_prot_rx =
+            vm_protect(task, patch_page_addr, PAGE_SZ_4K, 0, VM_PROT_READ | VM_PROT_EXECUTE);
+        mach_check(kr_prot_rx, "vm_protect RX");
+        return true;
+    }
 }
 
 static bool inject(es_client_t *client, const es_message_t *message,
