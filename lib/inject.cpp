@@ -213,13 +213,15 @@ static void remap_patch_dylib(const task_t task, const uint64_t patch_page_addr,
     const auto our_patch_page_addr =
         (uint64_t)ptrauth_strip(our_patch_page_ptr, ptrauth_key_process_independent_code);
 #endif
+    fmt::print("patch_page_addr: {:p}\n", (void *)patch_page_addr);
     fmt::print("our_patch_page_addr: {:p}\n", (void *)our_patch_page_addr);
+    const auto kr_dealloc = vm_deallocate(task, patch_page_addr, PAGE_SZ_16K);
+    mach_check(kr_dealloc, "vm_deallocate remap");
     vm_prot_t cur_prot         = VM_PROT_NONE;
     vm_prot_t max_prot         = VM_PROT_NONE;
     vm_address_t remapped_addr = patch_page_addr;
     const auto kr_remap =
-        vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0,
-                 VM_FLAGS_ANYWHERE | VM_FLAGS_RETURN_DATA_ADDR, mach_task_self(),
+        vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0, VM_FLAGS_RETURN_DATA_ADDR, mach_task_self(),
                  (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
     fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
                cur_prot, max_prot);
@@ -351,7 +353,7 @@ static uint64_t get_amfi_check_dyld_policy_self_addr(const task_t task, const ui
     assert(!"symtab not found");
 }
 
-std::pair<std::string, std::string> split_var(const std::string var_val) {
+static std::pair<std::string, std::string> split_var(const std::string var_val) {
     const auto delim = var_val.find('=');
     assert(delim != std::string::npos);
     const auto var = var_val.substr(0, delim);
@@ -359,8 +361,24 @@ std::pair<std::string, std::string> split_var(const std::string var_val) {
     return std::make_pair(var, val);
 }
 
-std::string cat_var(const std::pair<std::string, std::string> &var_val) {
+static std::string cat_var(const std::pair<std::string, std::string> &var_val) {
     return var_val.first + "=" + var_val.second;
+}
+
+static void dump_args(int argc, const char **argv, const char **envp, const char **apple) {
+    int i;
+    fmt::print("> argc: {:d}\n", argc);
+    for (i = 0; i < argc; ++i) {
+        fmt::print("> argv[{:d}] = {:s}\n", i, argv[i]);
+    }
+    i = 0;
+    for (const char **p = envp; p != nullptr; ++p, ++i) {
+        fmt::print("> envp[{:d}] = {:s}\n", i, *p);
+    }
+    i = 0;
+    for (const char **p = apple; p != nullptr; ++p, ++i) {
+        fmt::print("> apple[{:d}] = {:s}\n", i, *p);
+    }
 }
 
 /* bsd/kern/kern_exec.c: exec_copyout_strings
@@ -433,7 +451,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
 
     const auto unk_addr = sp;
     const auto unk      = read_target<uint64_t>(task, unk_addr);
-    DUMP(fmt::print("unk: {:#0x}\n", unk_addr));
+    DUMP(fmt::print("unk: {:#0x}\n", unk));
 
     const auto argc_addr = sp + sizeof(uint64_t);
     const auto argc      = read_target<int32_t>(task, argc_addr);
@@ -553,6 +571,7 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     }
     *ptr = UINT64_MAX;
     ++ptr;
+    assert(ptr_buf.data() + ptr_buf.size() == (uint8_t *)ptr);
     while (strs.size() % 16 != 0) {
         strs += "\0"s;
     }
@@ -567,11 +586,17 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
     const auto ptrs_addr = strs_addr - ptr_buf.size();
+    fmt::print("ptrs_addr = {:p} ptr_buf.size(): {:#0x} ptr_buf end: {:p}\n", (void *)ptrs_addr,
+               ptr_buf.size(), (void *)(ptrs_addr + ptr_buf.size() + strs.size()));
+
     write_target(task, ptrs_addr, std::span<uint8_t>(ptr_buf.data(), ptr_buf.size()));
     fmt::print("new sp: {:p}\n", (void *)ptrs_addr);
+    // dump_args()
     set_sp(thread, ptrs_addr);
 #undef DUMP
 }
+
+__attribute__((used)) int dummy_var;
 
 static bool patch_dyld(const task_t task) {
     const auto dyld_base = get_dyld_base(task);
@@ -602,8 +627,9 @@ static bool patch_dyld(const task_t task) {
     // str x8, [x1]
     // mov w0, #0
     // ret
-    const uint8_t patch[] = {0x08, 0x00, 0x80, 0x92, 0x28, 0x00, 0x00, 0xf9,
-                             0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+    // const uint8_t patch[] = {0x08, 0x00, 0x80, 0x92, 0x28, 0x00, 0x00, 0xf9,
+    //                          0x00, 0x00, 0x80, 0x52, 0xc0, 0x03, 0x5f, 0xd6};
+    const uint8_t patch[] = {0x20, 0x00, 0x20, 0xd4};
 #elif defined(__x86_64__)
     // or qword ptr [rsi], -1
     // xor eax, eax
