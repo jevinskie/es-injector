@@ -220,12 +220,14 @@ static void remap_patch_dylib(const task_t task, const uint64_t patch_page_addr,
     vm_prot_t cur_prot         = VM_PROT_NONE;
     vm_prot_t max_prot         = VM_PROT_NONE;
     vm_address_t remapped_addr = patch_page_addr;
-    const auto kr_remap =
-        vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0, VM_FLAGS_RETURN_DATA_ADDR, mach_task_self(),
-                 (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot, VM_INHERIT_NONE);
-    fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
-               cur_prot, max_prot);
-    mach_check(kr_remap, "vm_remap");
+    // const auto kr_remap =
+    //     vm_remap(task, &remapped_addr, PAGE_SZ_16K, 0, VM_FLAGS_RETURN_DATA_ADDR,
+    //     mach_task_self(),
+    //              (vm_address_t)our_patch_page_addr, false, &cur_prot, &max_prot,
+    //              VM_INHERIT_NONE);
+    // fmt::print("remapped_addr: {:p} cur_prot: {:#0x} max_prot: {:#0x}\n", (void *)remapped_addr,
+    //            cur_prot, max_prot);
+    // mach_check(kr_remap, "vm_remap");
 }
 
 static uint64_t get_dyld_base(const task_t task) {
@@ -662,6 +664,7 @@ static bool inject(es_client_t *client, const es_message_t *message,
                    const std::vector<std::string> &injected_env_vars, const bool dump) {
     const auto pid = audit_token_to_pid(message->process->audit_token);
     assert(pid);
+    fmt::print("injecting pid: {:d}\n", pid);
     // assert(!ptrace(PT_ATTACHEXC, pid, nullptr, 0));
     task_t task = MACH_PORT_NULL;
     mach_check(task_for_pid(mach_task_self(), pid, &task), "tfp");
