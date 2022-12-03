@@ -28,6 +28,7 @@ set(ES_INJECTOR_PRIVATE_LIBS
     bsm
     EndpointSecurity
     thread-pool
+    jeviterm
 )
 
 # ES_INJECTOR_HDR added for Xcode project generation

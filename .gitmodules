@@ -7,3 +7,6 @@
 [submodule "3rdparty/thread-pool"]
 	path = 3rdparty/thread-pool
 	url = https://github.com/bshoshany/thread-pool
+[submodule "3rdparty/jeviterm"]
+	path = 3rdparty/jeviterm
+	url = https://github.com/jevinskie/jeviterm

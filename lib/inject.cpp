@@ -528,6 +528,8 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
 
+    assert(env_vars.size() == envc);
+    assert(apple_vars.size() == applec);
     const auto num_ptrs     = 2 + argc + envc + applec + 3;
     const auto num_pad_ptrs = num_ptrs % 2 ? 1 : 0;
     auto ptr_buf            = std::vector<uint8_t>((num_ptrs + num_pad_ptrs) * sizeof(uint64_t));
@@ -571,6 +573,10 @@ static void inject_env_vars(const task_t task, const thread_t thread,
     }
     *ptr = UINT64_MAX;
     ++ptr;
+    while ((uint64_t)ptr % 16) {
+        ++ptr;
+    }
+    fmt::print("ptr: {:p} end: {:p}\n", fmt::ptr(ptr), fmt::ptr(ptr_buf.data() + ptr_buf.size()));
     assert(ptr_buf.data() + ptr_buf.size() == (uint8_t *)ptr);
     while (strs.size() % 16 != 0) {
         strs += "\0"s;
@@ -648,9 +654,13 @@ static bool patch_dyld(const task_t task) {
 
     const auto patch_page_addr = rounddown_pow2_mul(amfi_check_dyld_policy_self_addr, PAGE_SZ_16K);
     auto patch_page_buf        = read_target(task, patch_page_addr, PAGE_SZ_16K);
-    if (false) {
+    if (true) {
         const auto patch_page_off = amfi_check_dyld_policy_self_addr - patch_page_addr;
-        std::copy(patch, patch + sizeof(patch), &patch_page_buf.data()[patch_page_off]);
+        std::copy(patch, patch + sizeof(patch), patch_page_buf.data() + patch_page_off);
+        if (false) {
+            std::copy(breakpoint, breakpoint + sizeof(breakpoint),
+                      patch_page_buf.data() + patch_page_off);
+        }
     } else {
         for (unsigned int off = 0; off < patch_page_buf.size() - sizeof(breakpoint);
              off += sizeof(nop)) {
