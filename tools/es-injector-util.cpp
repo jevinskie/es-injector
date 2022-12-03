@@ -16,6 +16,10 @@ int main(int argc, const char **argv) {
         .nargs(argparse::nargs_pattern::at_least_one)
         .help("target executable");
     parser.add_argument("-d", "--dump").default_value(false).implicit_value(true).help("dump info");
+    parser.add_argument("-D", "--debug")
+        .default_value(false)
+        .implicit_value(true)
+        .help("attach debugger to injected processes");
 
     try {
         parser.parse_args(argc, argv);
@@ -32,7 +36,8 @@ int main(int argc, const char **argv) {
     const auto env_vars    = parser.get<std::vector<std::string>>("--env-var");
     const auto executables = parser.get<std::vector<std::string>>("--executable");
     const auto dump        = parser.get<bool>("--dump");
-    run_injector(env_vars, executables, dump);
+    const auto debug       = parser.get<bool>("--debug");
+    run_injector(env_vars, executables, dump, debug);
 
     return -1;
 }

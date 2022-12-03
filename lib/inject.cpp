@@ -28,6 +28,7 @@
 
 #include <BS_thread_pool.hpp>
 #include <fmt/format.h>
+#include <jeviterm.h>
 
 using namespace std::string_literals;
 namespace fs = std::filesystem;
@@ -57,6 +58,15 @@ static void checked_system(const std::vector<std::string> &argv) {
     fmt::print("cmd: {:s}\n", cmd);
     const auto res = system(cmd.c_str());
     assert(!res);
+}
+
+static void attach_lldb(const pid_t pid) {
+    const auto cmd = fmt::format("/usr/bin/env zsh -l -c \"lldb -p {:d}; read\"", pid);
+    fmt::print("launching iterm with command: {:s}\n", cmd);
+    const char *cmds[] = {cmd.c_str(), nullptr};
+    assert(jeviterm_open_tabs(cmds, true, JEVITERM_NEW_WINDOW_ID, "es-injector") !=
+           JEVITERM_NONE_WINDOW_ID);
+    fmt::print("spawn of lldb complete\n");
 }
 
 // https://gist.github.com/ccbrown/9722406
@@ -528,8 +538,8 @@ static void inject_env_vars(const task_t task, const thread_t thread,
         }
     }
 
-    assert(env_vars.size() == envc);
-    assert(apple_vars.size() == applec);
+    assert(env_vars.size() == (size_t)envc);
+    assert(apple_vars.size() == (size_t)applec);
     const auto num_ptrs     = 2 + argc + envc + applec + 3;
     const auto num_pad_ptrs = num_ptrs % 2 ? 1 : 0;
     auto ptr_buf            = std::vector<uint8_t>((num_ptrs + num_pad_ptrs) * sizeof(uint64_t));
@@ -687,10 +697,15 @@ static bool patch_dyld(const task_t task) {
 }
 
 static bool inject(es_client_t *client, const es_message_t *message,
-                   const std::vector<std::string> &injected_env_vars, const bool dump) {
+                   const std::vector<std::string> &injected_env_vars, const bool dump,
+                   const bool debug) {
     const auto pid = audit_token_to_pid(message->process->audit_token);
     assert(pid);
     fmt::print("injecting pid: {:d}\n", pid);
+    if (debug) {
+        fmt::print("attaching debugger to pid: {:d}\n", pid);
+        attach_lldb(pid);
+    }
     // assert(!ptrace(PT_ATTACHEXC, pid, nullptr, 0));
     task_t task = MACH_PORT_NULL;
     mach_check(task_for_pid(mach_task_self(), pid, &task), "tfp");
@@ -719,14 +734,14 @@ static bool inject(es_client_t *client, const es_message_t *message,
 static void es_cb(es_client_t *client, const es_message_t *message,
                   const std::vector<std::string> &injected_env_vars,
                   const std::set<std::string> &target_executables, BS::thread_pool *thread_pool,
-                  bool dump) {
+                  const bool dump, const bool debug) {
     switch (message->event_type) {
     case ES_EVENT_TYPE_AUTH_EXEC: {
         const auto path = std::string(message->event.exec.target->executable->path.data);
         if (target_executables.contains(path)) {
             std::filesystem::path p(path);
             fmt::print("found target: {:s}\n", p.filename().string());
-            thread_pool->push_task(inject, client, message, injected_env_vars, dump);
+            thread_pool->push_task(inject, client, message, injected_env_vars, dump, debug);
         } else {
             es_respond_auth_result(client, message, ES_AUTH_RESULT_ALLOW, false);
         }
@@ -738,14 +753,15 @@ static void es_cb(es_client_t *client, const es_message_t *message,
 }
 
 void run_injector(const std::vector<std::string> &injected_env_vars,
-                  const std::vector<std::string> &target_executables, const bool dump) {
+                  const std::vector<std::string> &target_executables, const bool dump,
+                  const bool debug) {
     std::set<std::string> exes(target_executables.cbegin(), target_executables.cend());
     es_client_t *client                          = nullptr;
     std::unique_ptr<BS::thread_pool> thread_pool = std::make_unique<BS::thread_pool>();
     const auto tp                                = thread_pool.get();
     auto new_client_res =
         es_new_client(&client, ^(es_client_t *client, const es_message_t *message) {
-            es_cb(client, message, injected_env_vars, exes, tp, dump);
+            es_cb(client, message, injected_env_vars, exes, tp, dump, debug);
         });
     assert(client && new_client_res == ES_NEW_CLIENT_RESULT_SUCCESS);
     es_event_type_t events[] = {ES_EVENT_TYPE_AUTH_EXEC};
